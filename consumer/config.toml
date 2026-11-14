@@ -1,0 +1,34 @@
+# nanochatn't 🐣
+# Consumer GPU configuration
+
+[dataset]
+name = "climbmix"
+train_shards = 3
+download_workers = 4
+
+[tokenizer]
+vocab_size = 32_768
+max_chars = 2_000_000_000
+doc_cap = 10_000
+
+[packing]
+row_len = 2048 # tokens per packed row = the largest max_seq_len models can train at
+workers = 2
+#tokenizer_threads = 4 future implementaion
+
+[model]
+depth = 4
+aspect_ratio = 64
+head_dim = 128
+max_seq_len = 2048 # context length to train at (at most the row length the data was prepared with)
+window_pattern = "L"
+
+[training]
+model_tag = "nanochatnt_d4_ctx2048_v1"
+device_type = "cuda"
+device_batch_size = 2
+target_param_data_ratio = 12.0
+warmup_steps = 40
+eval_every = 100
+eval_tokens = 262_144
+save_every = 200
