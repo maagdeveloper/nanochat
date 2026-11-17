@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+import re
 
 from consumer.config import load_config
 from nanochat.common import get_dataset_dir
@@ -431,10 +432,23 @@ def _snapshot_packed(cfg):
         for i in range(cfg["dataset"]["train_shards"])
     ] + ["val_00000.bin"]
     found = {p.name for p in view.glob("*.bin")}
-    if found != set(expected):
+    expected_set = set(expected)
+
+    missing = expected_set - found
+
+    unexpected = {
+        name for name in found - expected_set
+        if not (
+                re.fullmatch(r"sft_train_[0-9]{5}\.bin", name)
+                or name == "sft_val_00000.bin"
+        )
+    }
+
+    if missing or unexpected:
         raise RuntimeError(
-            f"Incomplete or unexpected packed shards in {view}: "
-            f"expected {sorted(expected)}, found {sorted(found)}"
+            f"Invalid packed shards in {view}: "
+            f"missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
         )
 
     native_tok_id = tokenizer_id(str(tok_dir))

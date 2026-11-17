@@ -85,7 +85,17 @@
 ### D. Hugging Face compatibility — validated base path, explicit scope limits
 
 - **HISTORIC VERIFIED (pinned):** The official converter at the recorded revision **completed** and produced a loadable model, but skipped seven `experiment_refactor` tensors. The consumer port was reported to preserve 33/33 with tested native/HF forward and cached parity. See `HF_COMPATIBILITY.md`.
-- **INTENTIONAL / LIMITED:** `modeling_nanochat_refactor.py` currently implements **`window_pattern="L"` only**. Sliding-window `S` is not supported, even though the config parser accepts patterns containing `S`; `forward()` rejects them.
+- **OPEN FEATURE GAP — HF Sliding Window Support**
+  - Current HF port supports `window_pattern="L"` only.
+  - Support native `S`, `L`, and mixed window patterns.
+  - Match nanochat's `compute_window_sizes()` behavior exactly.
+  - Respect `short_seq_len` and per-layer attention windows.
+  - Preserve GQA, RoPE, KV Cache, and left-padding behavior.
+  - Verify native/HF logits, cached decoding, and generation parity.
+  - Test `L`, `S`, and mixed patterns such as `SSSL`.
+  - Do not modify upstream nanochat.
+  - Complete before declaring generic HF Base Export support.
+  - Defer implementation until the HF Export milestone.
 - **INTENTIONAL:** Hugging Face `forward(labels=...)` raises `NotImplementedError`: training stays native for now.
 - **TO REVIEW:** Fail early for unsupported window patterns or invalid shape/rotary assumptions at configuration/initialization where appropriate.
 - **TO TEST:** Additional supported shapes, prefill versus incremental cached decode, multi-step batched left-padding, positional/mask handling, intermediate activations and per-layer KV contents.
