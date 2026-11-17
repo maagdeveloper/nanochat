@@ -1,140 +1,173 @@
-"""Pack existing parquet shards using nanochat's original BOS-aligned pack_rows."""
+"""Delegate tokenizer training and pretraining packing to native nanochat."""
 
 import argparse
+import hashlib
+import json
 import os
-from multiprocessing import Pool
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
-import numpy as np
-import pyarrow.parquet as pq
-
+from consumer.artifacts import (
+    NATIVE_PROVENANCE_LOCK,
+    PACKED_LOCK,
+    RAW_INPUTS_LOCK,
+    TOKENIZER_LOCK,
+    create_packing_view,
+    plan_artifacts,
+    require_locked_packed,
+    require_locked_raw_inputs,
+    require_locked_tokenizer,
+    require_native_provenance,
+    seal_native_provenance,
+    _native_sources_snapshot,
+    seal_verified_packed,
+    seal_verified_tokenizer,
+)
 from consumer.config import cli_config, print_effective_args
-from harness.dataset import list_parquet_files
-from nanochat.dataloader import HEADER_BYTES, pack_rows, read_header, write_shard
-from nanochat.tokenizer import RustBPETokenizer, get_tokenizer_dir, tokenizer_id
-from consumer.artifacts import create_packing_view
-
-TOKENIZER_THREADS = 4  # Matches nanochat base_prepare.py
 
 
-def init_worker(tokenizer_dir):
-    global worker_tokenizer
-    worker_tokenizer = RustBPETokenizer.from_directory(tokenizer_dir)
+# Intent record for an interrupted *consumer-initiated* native preparation.
+# This is a recovery marker, not cryptographic proof of output provenance.
+PENDING_PREPARATION = ".consumer_prepare_pending.json"
 
 
-def pack_shard(job):
-    parquet_path, output_path, row_len, vocab_size, tok_id = job
-    capacity = row_len + 1
-    bos = worker_tokenizer.get_bos_token_id()
-    raw_tokens = 0
+def pending_record(plan):
+    raw_lock = Path(plan["tokenizer"]) / RAW_INPUTS_LOCK
+    return {
+        "schema": 3,
+        "tokenizer_name": plan["tokenizer_name"],
+        "packed_name": plan["packed_name"],
+        "raw_lock_sha256": hashlib.sha256(raw_lock.read_bytes()).hexdigest(),
+        "native_source_sha256": _native_sources_snapshot()["source_sha256"],
+    }
 
-    def documents():
-        nonlocal raw_tokens
-        parquet = pq.ParquetFile(parquet_path)
-        for rg_idx in range(parquet.num_row_groups):
-            texts = parquet.read_row_group(rg_idx).column("text").to_pylist()
-            batches = worker_tokenizer.encode(
-                texts, prepend=bos, num_threads=TOKENIZER_THREADS
-            )
-            for ids in batches:
-                raw_tokens += len(ids)
-                yield ids[:capacity]
 
-    rows = np.stack([
-        np.asarray(row, dtype=np.uint16)
-        for row in pack_rows(documents(), capacity)
-    ])
-    write_shard(str(output_path), rows[:, :-1], rows[:, 1:], vocab_size, tok_id)
-    return output_path.name, len(rows), raw_tokens
+def check_pending(path, expected):
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Invalid preparation marker: {path}")
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Invalid preparation marker: {path}") from exc
+    if recorded != expected:
+        raise RuntimeError(f"Preparation marker does not match this run: {path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pack nanochat pretraining shards")
+    parser = argparse.ArgumentParser(description="Prepare pretraining shards with native nanochat")
     cfg = cli_config(parser)
     parser.add_argument("--dataset", default=cfg["dataset"]["name"])
     parser.add_argument("-n", "--train-shards", type=int,
                         default=cfg["dataset"]["train_shards"])
-    parser.add_argument("--row-len", type=int,
-                        default=cfg["packing"]["row_len"])
-    parser.add_argument("--workers", type=int,
-                        default=cfg["packing"]["workers"])
+    parser.add_argument("--row-len", type=int, default=cfg["packing"]["row_len"])
+    parser.add_argument("--workers", type=int, default=cfg["packing"]["workers"])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show the native command without creating artifacts")
     args = parser.parse_args()
 
     if args.show_config:
         print_effective_args(args)
         return
+    if args.train_shards < 1 or args.row_len < 1 or args.workers < 1:
+        parser.error("--train-shards, --row-len and --workers must be positive")
 
-    if args.row_len < 1 or args.workers < 1 or args.train_shards < 1:
-        parser.error("--row-len, --workers and --train-shards must be positive")
-
-    # Resolve artifact paths from effective CLI + TOML settings.
     effective = {
         **cfg,
-        "dataset": {
-            **cfg["dataset"],
-            "name": args.dataset,
-            "train_shards": args.train_shards,
-        },
-        "packing": {
-            **cfg["packing"],
-            "row_len": args.row_len,
-            "workers": args.workers,
-        },
+        "dataset": {**cfg["dataset"], "name": args.dataset,
+                    "train_shards": args.train_shards},
+        "packing": {**cfg["packing"], "row_len": args.row_len,
+                    "workers": args.workers},
     }
+    plan = plan_artifacts(effective)
 
-    dataset_dir = Path(create_packing_view(effective))
-
-    # Let nanochat resolve the tokenizer from the active packing view.
-    os.environ["NANOCHAT_DATASET"] = dataset_dir.name
-    tok_dir = Path(get_tokenizer_dir())
-    tokenizer = RustBPETokenizer.from_directory(str(tok_dir))
-    vocab_size = tokenizer.get_vocab_size()
-    tok_id = tokenizer_id(str(tok_dir))
-
-    parquets = list_parquet_files(str(dataset_dir))
-    if len(parquets) < 2:
-        raise RuntimeError("Dataset needs train and validation shards")
-    if len(parquets) - 1 < args.train_shards:
-        raise RuntimeError(f"Only {len(parquets) - 1} training shards found")
-
-    train_parquets = parquets[:-1][:args.train_shards]
-    val_parquet = parquets[-1]
-    jobs = [
-        (path, dataset_dir / f"train_{i:05d}.bin", args.row_len, vocab_size, tok_id)
-        for i, path in enumerate(train_parquets)
+    command = [
+        sys.executable, "-u", "-m", "scripts.base_prepare",
+        "-n", str(args.train_shards),
+        "-T", str(args.row_len),
+        "-w", str(args.workers),
+        "--vocab-size", str(effective["tokenizer"]["vocab_size"]),
+        "--max-chars", str(effective["tokenizer"]["max_chars"]),
+        "--doc-cap", str(effective["tokenizer"]["doc_cap"]),
     ]
-    jobs.append((val_parquet, dataset_dir / "val_00000.bin",
-                 args.row_len, vocab_size, tok_id))
 
-    pending = []
-    for job in jobs:
-        path = job[1]
-        if not path.exists():
-            pending.append(job)
-            continue
-        existing_len, rows, existing_vocab, existing_id = read_header(str(path))
-        if (existing_len, existing_vocab, existing_id) != (
-            args.row_len, vocab_size, tok_id
-        ):
-            raise RuntimeError(f"Incompatible packed shard: {path}")
-        expected_bytes = HEADER_BYTES + rows * args.row_len * 2 * np.dtype(np.uint16).itemsize
-        if path.stat().st_size != expected_bytes:
-            raise RuntimeError(f"Invalid shard size: {path}")
-        print(f"SKIP: {path.name} ({rows:,} rows)")
+    print(f"Packed view: {plan['packed']}")
+    print(f"NANOCHAT_DATASET={plan['packed_name']}")
+    print("Native command:", shlex.join(command))
 
-    print(f"Tokenizer ID: {tok_id}")
-    print(f"Vocabulary: {vocab_size:,}")
-    print(f"Row length: {args.row_len:,}")
-    print(f"Packing: {len(pending)}/{len(jobs)} shards")
+    if args.dry_run:
+        print("DRY RUN: no packing or view creation performed")
+        return
 
-    if pending:
-        with Pool(args.workers, initializer=init_worker, initargs=(str(tok_dir),)) as pool:
-            for name, rows, raw_tokens in pool.imap_unordered(pack_shard, pending):
-                packed = rows * (args.row_len + 1)
-                cropped = 100 * (1 - packed / raw_tokens)
-                print(f"{name}: {rows:,} rows | {packed:,} packed tokens | {cropped:.1f}% cropped")
+    # Consumer creates views and verifies inputs; nanochat performs preparation.
+    view = Path(create_packing_view(effective))
+    require_locked_raw_inputs(effective)
 
-    print("Packing completed.")
+    tokenizer_dir = Path(plan["tokenizer"]) / "tokenizer"
+    tokenizer_present = (tokenizer_dir / "tokenizer.pkl").is_file()
+    tokenizer_lock = Path(plan["tokenizer"]) / TOKENIZER_LOCK
+    packed_lock = view / PACKED_LOCK
+    native_lock = view / NATIVE_PROVENANCE_LOCK
+    pending = Path(plan["tokenizer"]) / PENDING_PREPARATION
+    expected = pending_record(plan)
+
+    resuming = pending.exists() or pending.is_symlink()
+    if resuming:
+        check_pending(pending, expected)
+        print("Resuming interrupted native preparation", flush=True)
+
+    # Existing tokenizer files must be verified or belong to our interrupted run.
+    if tokenizer_lock.exists() or tokenizer_lock.is_symlink():
+        require_locked_tokenizer(effective)
+    elif tokenizer_present and not resuming:
+        raise RuntimeError(f"Unverified tokenizer without preparation marker: {tokenizer_dir}")
+
+    # Never silently bless pre-existing .bin payloads without a packed lock.
+    if packed_lock.exists() or packed_lock.is_symlink():
+        require_locked_packed(effective)
+    elif list(view.glob("*.bin")) and not resuming:
+        raise RuntimeError(f"Unverified packed shards without preparation marker: {view}")
+
+    # Never backfill provenance for pre-existing outputs without an active
+    # consumer preparation marker. Existing provenance must match current code.
+    if native_lock.exists() or native_lock.is_symlink():
+        require_native_provenance(effective)
+    elif packed_lock.is_file() and not resuming:
+        raise RuntimeError(f"Existing packed artifacts have no native provenance: {view}")
+
+    # Mark the entire native preparation as in progress, until all locks exist.
+    if not resuming and not packed_lock.is_file():
+        with pending.open("x", encoding="utf-8") as handle:
+            json.dump(expected, handle, sort_keys=True)
+            handle.write("\n")
+
+    env = os.environ.copy()
+    env["NANOCHAT_DATASET"] = view.name
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run(command, cwd=root, env=env, check=True)
+
+    if not tokenizer_lock.is_file():
+        seal_verified_tokenizer(effective)
+    require_locked_tokenizer(effective)
+
+    if not packed_lock.is_file():
+        seal_verified_packed(effective)
+    require_locked_packed(effective)
+
+    # A successful native run is not enough to claim provenance if the source
+    # changed during execution. Keep the marker so recovery remains explicit.
+    if pending.exists() or pending.is_symlink():
+        check_pending(pending, expected)
+    if not native_lock.is_file():
+        if not pending.is_file():
+            raise RuntimeError(f"Cannot establish native provenance without preparation marker: {view}")
+        seal_native_provenance(effective)
+    require_native_provenance(effective)
+
+    # Clear recovery intent only after all three output locks verify.
+    pending.unlink(missing_ok=True)
+    print("Verified native preparation: tokenizer, packed, and native provenance locks", flush=True)
 
 
 if __name__ == "__main__":

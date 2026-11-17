@@ -1,21 +1,31 @@
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-from consumer.config import load_config
-from consumer.artifacts import plan_artifacts
+from consumer.config import DEFAULT_CONFIG, load_config
+from consumer.artifacts import plan_artifacts, require_native_provenance
 from nanochat.tokenizer import get_tokenizer_dir, tokenizer_id
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help="Consumer TOML configuration")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume-from-step", type=int, default=-1,
+                        help="Resume a native checkpoint step (-1 = new run)")
     args = parser.parse_args()
+    if args.resume_from_step != -1 and args.resume_from_step < 1:
+        parser.error("--resume-from-step must be a positive checkpoint step")
+    resuming = args.resume_from_step != -1
 
-    cfg = load_config()
+    cfg = load_config(args.config)
+    # Verify raw inputs, tokenizer, packed payloads, and native preparation provenance.
+    require_native_provenance(cfg)
     dataset = cfg["dataset"]
     packing = cfg["packing"]
     model = cfg["model"]
@@ -75,6 +85,9 @@ def main():
         "--model-tag", training["model_tag"],
     ]
 
+    if resuming:
+        command.extend(["--resume-from-step", str(args.resume_from_step)])
+
     artifact_line = (
         f"artifact dataset={active_dataset} "
         f"tokenizer_id={actual_tokenizer_id}"
@@ -90,26 +103,76 @@ def main():
     print(f"Val rows: {val_info[1]:,}", flush=True)
 
     if args.dry_run:
+        if resuming:
+            print("DRY RUN: resume checkpoint not inspected")
         print("DRY RUN: no training performed")
         return
 
     from harness.checkpoint import get_checkpoint_dir
 
     log_dir = Path(get_checkpoint_dir(training["model_tag"], "base"))
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "train.log"
 
-    # Never silently overwrite logs or existing checkpoints.
-    if log_path.exists() or any(log_dir.glob("model_*.pt")):
-        parser.error(
-            f"Run already exists: {log_dir}. "
-            "Choose a new model_tag or resume explicitly."
-        )
+    if resuming:
+        step = args.resume_from_step
+        required = [
+            log_dir / f"model_{step:06d}.pt",
+            log_dir / f"optim_{step:06d}_rank0.pt",
+            log_dir / f"meta_{step:06d}.json",
+            log_path,
+        ]
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            parser.error("Cannot resume; missing: " + ", ".join(missing))
+
+        # Do not silently overwrite checkpoints newer than the requested step.
+        if any(
+            int(path.stem.split("_")[-1]) > step
+            for path in log_dir.glob("model_*.pt")
+            if path.stem.split("_")[-1].isdigit()
+        ):
+            parser.error("Newer checkpoints exist; refusing to rewind this run")
+
+        # A consumer run records the dataset and native tokenizer identity.
+        with log_path.open(encoding="utf-8") as log:
+            first_line = log.readline().strip()
+        if first_line != artifact_line:
+            parser.error("Resume dataset/tokenizer differs from recorded run")
+
+        metadata = json.loads((log_dir / f"meta_{step:06d}.json").read_text())
+        saved_args = metadata.get("user_config", {})
+        expected = {
+            "depth": model["depth"],
+            "aspect_ratio": model["aspect_ratio"],
+            "head_dim": model["head_dim"],
+            "max_seq_len": model["max_seq_len"],
+            "window_pattern": model["window_pattern"],
+            "num_shards": dataset["train_shards"],
+            "device_batch_size": training["device_batch_size"],
+            "target_param_data_ratio": training["target_param_data_ratio"],
+            "warmup_steps": training["warmup_steps"],
+            "model_tag": training["model_tag"],
+        }
+        if metadata.get("step") != step or any(
+            saved_args.get(key) != value for key, value in expected.items()
+        ):
+            parser.error("Resume checkpoint configuration differs from this run")
+    else:
+        # Never silently overwrite logs or checkpoints for a new run.
+        if log_path.exists() or any(log_dir.glob("model_*.pt")):
+            parser.error(
+                f"Run already exists: {log_dir}. "
+                "Choose a new model_tag or resume explicitly."
+            )
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     root = Path(__file__).resolve().parents[2]
 
-    with log_path.open("x", encoding="utf-8") as log:
-        log.write(artifact_line + "\n")
+    with log_path.open("a" if resuming else "x", encoding="utf-8") as log:
+        if resuming:
+            log.write(f"\nresume_from_step={args.resume_from_step} {artifact_line}\n")
+        else:
+            log.write(artifact_line + "\n")
         log.flush()
 
         with subprocess.Popen(

@@ -1,5 +1,7 @@
 # nanochatn't 🐣
 
+Basically: "NanoChat? Nah, not happening!" 😄
+
 *Because apparently, nano wasn't small enough.*
 
 A lightweight, reproducible workflow inside [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), designed to make language model training and Hugging Face export accessible on consumer GPUs.
@@ -27,6 +29,14 @@ Initial target: **NVIDIA RTX 3060 (12 GB VRAM)**, using a single GPU.
 - Reserve notebooks for exploration, visualization, and analysis.
 - Add only what solves a problem we've actually encountered.
 
+## 🔐 Reproducibility and Artifact Safety
+
+Consumer assigns versioned tokenizer/packing views and verifies SHA-256 manifests for the selected raw Parquet files, native tokenizer artifacts, packed shards, and relevant native preparation source files. This is an integrity/reuse safeguard, not proof that an unverified legacy cache was created by the recorded implementation.
+
+The training wrapper also supports explicit checkpoint resume with guards against missing artifacts, incompatible selected metadata, and rewinding past newer checkpoints. **Continuous-vs-resume training equivalence remains to be tested**; the latest reported frozen-gradient optimizer replay (33/33 compared updated tensors, max difference 0.0) is a narrower check and its test code was not included in this review.
+
+See [underreview.md](underreview.md) for exact implementation status, reported test scope, and open checks.
+
 ## 🤗 Hugging Face Compatibility
 
 Transformers already supports NanoChat. However, the official converter we tested **runs successfully but does not faithfully preserve** checkpoints from `experiment_refactor` at commit `07620a2`.
@@ -47,7 +57,7 @@ This journey is less about reinventing the wheel and more about understanding, a
 
 ## 🚀 Getting Started
 
-From the **nanochat repository root**, activate a Python environment with nanochat's dependencies installed, then review [consumer/config.toml](config.toml). The commands below use its settings by default.
+From the **nanochat repository root**, activate a Python environment with nanochat's dependencies installed, then review [consumer/config.toml](config.toml). The commands below use its settings by default. Data preparation, packing, and training accept `--config path/to/custom.toml`; automatic Hugging Face export currently uses the default config (or explicit checkpoint/tokenizer paths).
 
 ### 1. Prepare the dataset
 
@@ -55,19 +65,16 @@ From the **nanochat repository root**, activate a Python environment with nanoch
 python -m consumer.scripts.prepare_data
 ```
 
-### 2. Train or reuse the tokenizer
+### 2. Prepare the Tokenizer and Packed Dataset
 
-```bash
-python -m consumer.scripts.train_tokenizer
-```
-
-### 3. Pack the dataset
+Train the tokenizer (if missing), then tokenize and pack the
+dataset using nanochat's original `scripts.base_prepare` pipeline.
 
 ```bash
 python -m consumer.scripts.pack_dataset
 ```
 
-### 4. Pretrain
+### 3. Pretrain
 
 Check the effective command and data compatibility before starting:
 
@@ -76,9 +83,15 @@ python -m consumer.scripts.train --dry-run
 python -m consumer.scripts.train
 ```
 
-Use a **new `training.model_tag`** for a new run. Existing checkpoints and logs are not silently overwritten.
+Use a **new `training.model_tag`** for a new run. Existing checkpoints and logs are not silently overwritten. To resume a compatible run at an existing checkpoint step:
 
-### 5. Export the base model to Hugging Face
+```bash
+python -m consumer.scripts.train --resume-from-step 200
+```
+
+Replace `200` with a checkpoint step that actually exists for that run. Resume guards are implemented; full uninterrupted-vs-resume training equivalence is still an open test. `--dry-run` performs read-only artifact validation, including hashing, so it may take time on large datasets.
+
+### 4. Export the base model to Hugging Face
 
 ```bash
 python -m consumer.scripts.export_hf --dry-run
@@ -87,20 +100,22 @@ python -m consumer.scripts.export_hf
 
 The exporter also accepts `--checkpoint`, `--tokenizer-dir`, and `--output` to convert compatible `experiment_refactor` checkpoints independently of the training configuration. Existing export directories are not overwritten.
 
-**Status:** Base pretraining and Hugging Face export are verified. The SFT workflow and chat template are not yet included in these instructions.
+**Status:** Base pretraining and Hugging Face export have previously reported passing tests for the pinned `experiment_refactor` checkpoint. The current HF port is inference-only and supports full causal attention (`window_pattern="L"`) only; sliding-window `S` and SFT/chat export are not yet implemented.
 
 ## 📌 Roadmap
 
 - [x] Dataset preparation and configurable tokenization.
 - [x] Versioned tokenizer and packing artifacts.
-- [x] Pretraining, evaluation, checkpointing, and resume.
+- [x] Native pretraining/evaluation and checkpointing; consumer resume CLI and safety guards implemented.
+- [ ] Controlled continuous-vs-resume training equivalence test (model + optimizer + step/schedule + data/RNG state).
 - [x] Native inference and KV-cache validation.
 - [x] Hugging Face CausalLM and Fast Tokenizer export.
 - [x] Native/HF weight, logits, cache, and generation parity tests.
 - [x] Standalone Hugging Face model loading and batched left-padding tests.
 - [x] Document the tested official converter compatibility gap.
-- [ ] SFT training, chat template, and chat model export.
-- [ ] Artifact metadata and reproducibility improvements.
+- [ ] Native SFT smoke test, exact chat template, and HF chat model export.
+- [x] Raw/tokenizer/packed/native-source SHA-256 manifest checks implemented.
+- [ ] Artifact recovery/integration negative tests and complete config validation.
 - [ ] Interactive training and evaluation visualizations.
 - [ ] NeoCorpus integration.
 - [ ] Safe cache cleanup.
